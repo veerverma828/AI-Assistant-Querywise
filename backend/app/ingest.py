@@ -1,6 +1,7 @@
 import textwrap
 from pathlib import Path
 
+from langchain_core.documents import Document
 from pypdf import PdfReader
 
 CHUNK_SIZE = 1000  # max characters per chunk, heading included
@@ -73,17 +74,15 @@ def chunk_text(text: str, size: int = CHUNK_SIZE, overlap_lines: int = OVERLAP_L
     return chunks
 
 
-def build_chunks(path: Path) -> list[dict]:
-    """Chunk every page, keep filename + page number as metadata for citations."""
-    chunks = []
+def build_documents(path: Path) -> list[Document]:
+    """Chunk every page into LangChain Documents. Metadata carries the citation: file and page."""
+    docs = []
     for page in extract_pages(path):
         for i, piece in enumerate(chunk_text(page["text"])):
-            chunks.append(
-                {
-                    "source": path.name,
-                    "page": page["page"],
-                    "chunk_index": i,
-                    "text": piece,
-                }
+            docs.append(
+                Document(
+                    page_content=piece,
+                    metadata={"source": path.name, "page": page["page"], "chunk_index": i},
+                )
             )
-    return chunks
+    return docs

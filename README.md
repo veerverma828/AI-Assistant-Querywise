@@ -64,7 +64,7 @@ flowchart LR
         E["POST /agent/stream (SSE)"]
         P["POST /agent/approve"]
         U["/upload  /documents  /reports"]
-        AG["Agent loop"]
+        AG["LangGraph agent"]
         T["Tools"]
     end
 
@@ -95,7 +95,7 @@ sequenceDiagram
     actor User
     participant UI as React UI
     participant API as FastAPI
-    participant Agent as Agent loop
+    participant Agent as LangGraph agent
     participant LLM as Ollama (Qwen 2.5)
 
     User->>UI: "Make me a report on X"
@@ -117,7 +117,24 @@ sequenceDiagram
 
 ## The agent
 
-The agent is a plain loop in [`backend/app/agent.py`](backend/app/agent.py), with no framework: the model is called with the conversation and the tool schemas, any tool calls are executed and fed back, and the loop repeats until the model answers or the step cap (6) is reached.
+The agent is a small [LangGraph](https://langchain-ai.github.io/langgraph/) graph in [`backend/app/agent.py`](backend/app/agent.py): three nodes and a router.
+
+```mermaid
+flowchart LR
+    S([start]) --> A["agent: model call"]
+    A -->|model asked for tools| T["tools: run them"]
+    T --> A
+    A -->|report asked for, tool not called, first time| N["nudge: one corrective retry"]
+    N --> A
+    A -->|final answer| E([end])
+```
+
+- **agent**: `ChatOllama` with the tools bound. It either answers or asks for tools.
+- **tools**: LangGraph's `ToolNode` runs them. `save_report` calls `interrupt()`, which parks the whole run in the checkpointer until the user decides.
+- **nudge**: if the user asked for a report and the model answered in text instead of calling `save_report`, one corrective message sends it back to the model.
+- **step cap**: 6 model calls per run, enforced with the graph's recursion limit.
+
+The first from-scratch version of this agent (plain Python, hand-written loop and tool schemas) is kept in [`archive/basic-python`](archive/basic-python) and tagged `v1-basic-python`, as a readable baseline.
 
 | Tool | Purpose | Gated |
 |---|---|---|
@@ -138,7 +155,8 @@ Things I measured or ran into while building it, and what I did about them.
 - **Fixed-size chunks cut sections in half.** A 1000-character window split headings and words. Chunking now detects headings and packs whole lines, and every chunk carries its section heading so it keeps its context.
 - **Small models ask permission in text instead of calling the tool.** A 7B model often wrote the report in chat and asked "would you like to save it?". A small intent detector plus one corrective retry makes it call `save_report`, so the approval card, not the model, asks the question. The pattern was checked against 16 positive and negative phrasings.
 - **Context is a budget.** Ollama's default window is 4096 tokens. History is trimmed (last 6 messages; only the newest reply stays long), and tool results are capped, so rules, history, retrieved text and the answer all fit.
-- **Pause and resume without a framework.** A gated tool call stores the message history and the pending call under an id, ends the stream, and resumes from that state when `POST /agent/approve` arrives.
+- **Pause and resume.** `save_report` calls LangGraph's `interrupt()`. The run is parked under a thread id, the stream ends, and `POST /agent/approve` resumes it with `Command(resume=...)`. The from-scratch version did the same with a hand-rolled in-memory dict; the checkpointer replaces that and can be swapped for a SQLite one to survive restarts.
+- **Porting an embedding prefix is easy to get subtly wrong.** `nomic-embed-text` expects different task prefixes for documents and queries. In `langchain-ollama`, `embed_query()` internally calls `embed_documents()`, so my first subclass gave queries *both* prefixes and silently returned the wrong chunks. I caught it by comparing the new store's top-4 chunks with the original implementation on the same data (6 queries, now identical).
 - **Streamed text is not always the answer.** When a model "thinks out loud" before a tool call, that text is moved into the step timeline as a plan note instead of being shown as the answer.
 - **Defensive file handling.** Upload, delete and report endpoints reduce names to a bare file name, so `../` style paths cannot reach other folders.
 
@@ -147,7 +165,7 @@ Things I measured or ran into while building it, and what I did about them.
 - **Retrieval is plain top-2 vector search.** Broad "list everything" questions can miss a section of a document: in testing the same project question gave a correct answer once and a wrong "no projects listed" another time. Hybrid search, a reranker and query rewriting are the planned fixes.
 - **No automated evaluation yet.** Quality is checked by hand. A golden question set with routing accuracy, retrieval hit rate and faithfulness scoring is the next milestone.
 - **Prompt injection is not mitigated yet.** The agent reads web pages, which are untrusted text. The approval gate limits the damage, but there is no dedicated defense.
-- **Approvals live in memory.** Restarting the backend while a card is pending makes that approval expire.
+- **Approvals live in memory.** The checkpointer is `InMemorySaver`, so restarting the backend while a card is pending makes that approval expire. A SQLite checkpointer is the fix.
 - **Speed.** On a CPU-only laptop a multi-step answer takes roughly 20 to 70 seconds. A GPU makes it much faster.
 - **Single user, no auth.** It is designed to run locally.
 
@@ -155,9 +173,10 @@ Things I measured or ran into while building it, and what I did about them.
 
 | Layer | Technology |
 |---|---|
-| LLM | Qwen 2.5 7B through [Ollama](https://ollama.com) (tool calling, streaming) |
+| LLM | Qwen 2.5 7B through [Ollama](https://ollama.com) (tool calling, streaming), via `langchain-ollama` |
 | Embeddings | `nomic-embed-text` through Ollama |
-| Vector store | ChromaDB (persistent, cosine distance) |
+| Agent | LangGraph (`StateGraph`, `ToolNode`, `interrupt`, checkpointer) and LangChain tools |
+| Vector store | ChromaDB (persistent, cosine distance), via `langchain-chroma` |
 | Backend | Python 3.12+, FastAPI, Pydantic, `uv` |
 | Document parsing | `pypdf` |
 | Web access | `ddgs` (DuckDuckGo / Bing), `httpx`, BeautifulSoup |
@@ -201,11 +220,13 @@ Make sure Ollama is running, then open http://localhost:5173, attach a PDF or te
 ├── backend/
 │   └── app/
 │       ├── main.py          HTTP API: upload, agent stream, approve, reports, documents
-│       ├── agent.py         Tool schemas, agent loop, history, approval pause and resume
-│       ├── tools.py         Web search, page fetch, document search, report saving
-│       ├── ingest.py        PDF/text parsing and heading-aware chunking
-│       ├── vectorstore.py   Embeddings, Chroma storage, search, delete
-│       └── rag.py           Plain RAG pipeline (the /ask baseline)
+│       ├── agent.py         The LangGraph graph: model node, tool node, report-intent retry, history
+│       ├── tools.py         The @tool functions (web, documents, report with approval interrupt)
+│       ├── streaming.py     LangGraph stream -> the UI's event format (and resume after approval)
+│       ├── models.py        ChatOllama and the nomic embeddings wrapper
+│       ├── store.py         Chroma vector store, search, list and delete documents
+│       └── ingest.py        PDF/text parsing and heading-aware chunking into Documents
+├── archive/basic-python/    The original from-scratch backend (frozen, not imported)
 ├── frontend/
 │   └── src/
 │       ├── App.jsx          State, chat history, agent run logic
@@ -223,9 +244,6 @@ Make sure Ollama is running, then open http://localhost:5173, attach a PDF or te
 | `DELETE` | `/documents/{name}` | Delete a file and its chunks |
 | `POST` | `/agent/stream` | Run the agent; streams events (SSE) |
 | `POST` | `/agent/approve` | Approve or reject a paused action; streams the rest |
-| `POST` | `/agent` | Run the agent without streaming |
-| `POST` | `/ask` | Plain RAG answer with sources (no agent) |
-| `GET` | `/search?q=` | Raw vector search |
 | `GET` / `POST` | `/reports` | List reports / save one directly |
 | `GET` / `DELETE` | `/reports/{name}` | Read or delete a report |
 
@@ -233,8 +251,9 @@ Make sure Ollama is running, then open http://localhost:5173, attach a PDF or te
 
 | What | Where |
 |---|---|
-| Agent model, step limit, history size | `AGENT_MODEL`, `MAX_STEPS`, `MAX_HISTORY_MESSAGES` in `backend/app/agent.py` |
-| Embedding model, batch size | `EMBED_MODEL`, `BATCH_SIZE` in `backend/app/vectorstore.py` |
+| Chat and embedding models | `CHAT_MODEL`, `EMBED_MODEL` in `backend/app/models.py` |
+| Step limit, history size | `MAX_STEPS`, `MAX_HISTORY_MESSAGES` in `backend/app/agent.py` |
+| Embedding batch size | `BATCH_SIZE` in `backend/app/store.py` |
 | Chunk size and overlap | `CHUNK_SIZE`, `OVERLAP_LINES` in `backend/app/ingest.py` |
 | Passages sent to the model | `TOP_K` in `backend/app/tools.py` |
 | Backend URL used by the UI | `API` in `frontend/src/api.js` |
@@ -247,7 +266,9 @@ Make sure Ollama is running, then open http://localhost:5173, attach a PDF or te
 - [ ] Structured answers with verified citations
 - [ ] Persist runs and chats server-side (SQLite) and add tracing
 - [ ] Unit tests for chunking and intent detection
-- [ ] Re-implement the loop with LangGraph and compare
+- [x] Re-implement the agent with LangChain / LangGraph (the from-scratch version is kept in `archive/basic-python`)
+- [ ] Compare the two implementations on the golden question set
+- [ ] Move conversation memory server-side with a persistent (SQLite) checkpointer
 
 ## Author
 

@@ -4,10 +4,13 @@ version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
     "beautifulsoup4>=4.15.0",
-    "chromadb>=1.5.9",
     "ddgs>=9.16.0",
     "fastapi>=0.142.2",
-    "ollama>=0.6.3",
+    "httpx>=0.28.1",
+    "langchain-chroma>=1.1.0",
+    "langchain-core>=1.6.9",
+    "langchain-ollama>=1.1.0",
+    "langgraph>=1.2.14",
     "pypdf>=6.19.0",
     "python-multipart>=0.0.32",
     "uvicorn[standard]>=0.54.0",

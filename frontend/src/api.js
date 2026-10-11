@@ -82,14 +82,3 @@ export async function saveReportDirect(title, content) {
 // `edits` may carry a changed title/content from the approval card.
 export const approveAction = (id, approved, edits, onEvent, signal) =>
   postStream("/agent/approve", { id, approved, ...edits }, onEvent, signal);
-
-// Plain RAG endpoint (no agent). Kept for evaluation later.
-export async function askQuestion(question) {
-  const res = await fetch(`${API}/ask`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ question }),
-  });
-  if (!res.ok) throw new Error(`Ask failed (${res.status})`);
-  return res.json();
-}
